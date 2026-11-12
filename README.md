@@ -1,124 +1,197 @@
 # host-manager
 
-Личный учёт VPS: Rust TUI, тарифы и оплаты по валютам, архив, обычные интерактивные SSH-сессии. Все данные, включая финансы и пароли, находятся внутри одной зашифрованной записи существующего **pass**. Приложение не управляет услугами у провайдеров.
+[Russian documentation](docs/README.ru.md)
 
-## Требования и запуск
+A terminal app for keeping track of your VPS: where they're hosted, what they cost, when payment is due, and how to log in.
 
-macOS/Linux, Rust stable ≥ 1.91 для сборки; `pass`, GPG, Git и OpenSSH в PATH. Нужен уже настроенный password-store с recipients и Git-репозиторием. Приложение не создаёт ключи, не выполняет `pass init`, не меняет Git/shell-конфигурацию.
+It keeps the catalog in your existing [pass](https://www.passwordstore.org/) store and uses OpenSSH for connections. Server details, credentials, and payment history are encrypted together. There is no separate database or set of keys to manage.
 
-```sh
-rustup run stable cargo test --locked
-rustup run stable cargo build --release --locked
-./target/release/host-manager
-./target/release/host-manager connect example-vps
-```
+The interface is currently in Russian. The app runs on macOS and Linux.
 
-Если установка Rust не содержит прокси `rustc`/`cargo-fmt` в PATH, добавьте каталог установленного stable **только для команды**, без изменения глобального default:
+## Install
 
-```sh
-PATH="$(dirname "$(rustup which --toolchain stable rustc)"):$PATH" \
-  rustup run stable cargo build --release --locked
-```
+You'll need `pass`, GPG, Git, and OpenSSH in your PATH, plus Rust stable 1.91 or newer to build. Your password-store must already have encryption recipients configured and be in a Git repository. host-manager won't initialize it or change your keys, Git settings, or shell configuration.
 
-### Установка
-
-Из папки проекта выполните:
+From the project directory:
 
 ```sh
 cargo +stable install --path . --locked
-host-manager
-host-manager connect "prod eu"
-host-manager template vps.json
-host-manager import vps.json
 ```
 
-По умолчанию бинарник устанавливается в `~/.cargo/bin`. Если этот каталог есть в PATH, приложение можно запускать из любой папки; `cargo run` больше не нужен.
+Cargo installs the binary in `~/.cargo/bin` by default. With that directory in your PATH, you can run it from anywhere:
 
-### Обновление
+```sh
+host-manager
+```
 
-После получения или изменения исходников закройте TUI и из папки проекта выполните:
+To run from source instead:
+
+```sh
+cargo +stable run
+cargo +stable run -- connect example-vps
+```
+
+### Updating
+
+Update your local source code, close any running TUI, and reinstall:
 
 ```sh
 cargo +stable install --path . --locked --force
 ```
 
-Команда пересоберёт приложение и заменит установленный бинарник. Данные в pass и выбор папки через `HOST_MANAGER_PASS_DIR` не удаляются. Автообновления нет: сначала обновляются исходники, затем повторяется установка с `--force`. Глобальный Rust default не меняется благодаря явному `+stable`.
+This replaces the binary, not your data in pass. There is no automatic updater. Using `+stable` also leaves your default Rust toolchain alone.
 
-### Запуск без установки
+## Choose a pass directory
 
-Из исходников: `cargo +stable run -- connect example-vps`.
+The default is `host-manager` inside your password-store: usually `~/.password-store/host-manager`, or `$PASSWORD_STORE_DIR/host-manager` if you've set a different root.
 
-## Папка pass
-
-По умолчанию: `$PASSWORD_STORE_DIR/host-manager`, а если корень не задан — `~/.password-store/host-manager`. Приоритет: `--pass-dir PATH` → `HOST_MANAGER_PASS_DIR` → папка по умолчанию. Пустое явно заданное значение — ошибка. Папка должна лежать **строго внутри** корня pass; `..` и симлинки внутри выбранного пути запрещены. Отсутствующая папка создаётся только при первом сохранении. Соседние записи не читаются.
+To choose another directory for one command:
 
 ```sh
 host-manager --pass-dir "$HOME/.password-store/infrastructure"
-host-manager --pass-dir "$HOME/.password-store/infrastructure" connect "prod eu"
-host-manager connect "prod eu" --pass-dir "$HOME/.password-store/infrastructure"
-HOST_MANAGER_PASS_DIR="$HOME/.password-store/infrastructure" host-manager connect "prod eu"
+```
+
+For regular use, set `HOST_MANAGER_PASS_DIR` in your shell:
+
+```sh
+export HOST_MANAGER_PASS_DIR="$HOME/.password-store/infrastructure"
+host-manager
+```
+
+`--pass-dir` takes precedence over the environment variable and works before or after the subcommand's arguments. Both take a filesystem path, not a pass entry name. An explicitly empty value is an error.
+
+The directory must be strictly inside the pass root. Paths containing `..` or symlinks within the selected path are rejected. A missing directory is created on the first save; neighboring pass entries are left alone. Encryption recipients follow normal pass rules, including a nested `.gpg-id`. There's no additional configuration file.
+
+For a separate password-store, set its root too:
+
+```sh
 PASSWORD_STORE_DIR=/path/to/store host-manager --pass-dir /path/to/store/host-manager
 ```
 
-Отдельный конфигурационный файл не нужен. Recipients наследуются по правилам pass, включая вложенную `.gpg-id`.
+## In the TUI
 
-## Импорт из текстового файла
+The main screen lists your servers and shows costs by currency. Search matches the server name, provider, or SSH host. Open a server to see its credentials, notes, and payment history.
+
+| Key | Action |
+| --- | --- |
+| `↑↓` | Select a server |
+| `Enter` | Open its details |
+| `/` | Search; `Enter` or `Esc` finishes the query |
+| `a` / `e` | Add / edit |
+| `p` | Record a payment |
+| `s` | Connect over SSH, after confirmation |
+| `x` | Archive or restore, after confirmation |
+| `Tab` / `Shift+Tab` | Switch between active and archived servers |
+| `r` | Reload the catalog |
+| `q` / `Ctrl+C` | Quit |
+
+In a form, use `Tab` and `Shift+Tab` to move between fields and buttons, or click a field. The mouse wheel moves between fields and brings hidden ones into view on smaller terminals, including 80×24. Use `←→` to change the billing period, `Ctrl+S` or the Save button to save, and `Esc` to cancel. Notes can span multiple lines.
+
+In the details view, `v` shows or hides passwords and `PageUp`/`PageDown` scrolls. Closing the view hides passwords again. Panel URLs are text only; the app doesn't open a browser or copy credentials to the clipboard.
+
+### Costs and payments
+
+Enter amounts with a decimal point or one decimal comma, without thousands separators. Currency codes are three ASCII letters, and dates use `YYYY-MM-DD`.
+
+Recording a payment adds a history entry and updates the next due date; it doesn't change the pricing plan. You must enter the next due date yourself. It has to be later than both the payment date and the old due date. Canceling the form writes nothing.
+
+The monthly estimate divides each plan amount by 1, 3, 6, or 12 for monthly, quarterly, half-yearly, or yearly billing. Other periods are shown as excluded from the estimate. Upcoming payments count one due date per active VPS in the next 30 days, including today; overdue amounts are shown separately. Currencies aren't combined or converted. Amounts use checked Decimal arithmetic and are rounded to two places for display after summation.
+
+Archiving keeps the server's credentials and history but removes it from cost summaries. It does **not** cancel anything with the hosting provider.
+
+## Connect without opening the TUI
 
 ```sh
-host-manager template ./vps.json
-# Заполните JSON-файл в своём редакторе.
-host-manager import ./vps.json
-# Для другой папки:
-host-manager --pass-dir "$HOME/.password-store/infrastructure" import ./vps.json
+host-manager connect example-vps
+host-manager connect "prod eu"
 ```
 
-`template FILE` создаёт UTF-8 JSON с полями существующего формата каталога, одной заготовкой VPS и новым UUID. Не требует pass, ключей или настроенного хранилища. Создаёт файл с правами `0600` и **никогда не перезаписывает существующий файл**, включая симлинк.
+The name must match exactly, including case, and identify one active server. Archived entries aren't connected to. Duplicate display names are allowed in the catalog, but you'll need to rename them if more than one active entry matches.
 
-Заполните `name`, `provider`, `billing.amount` (строка, например `"5.00"`), `billing.currency` и при необходимости `billing.next_due` (`"2026-12-01"` либо `null`). Для SSH заполните `ssh.host`; если SSH пока не нужен, замените весь объект на `"ssh": null`. Остальные реквизиты можно оставить `null`, заметки — строкой. Все ключи должны оставаться в документе. `period` — `month`, `quarter`, `half_year`, `year` или `other`; для `other` нужен `period_note`, иначе он `null`. Пустая история оплат — `[]`.
+This opens an ordinary SSH session without another application-level confirmation. SSH handles host-key checks, passwords, and key passphrases as usual. `connect` hands over the terminal to SSH, so its exit status and signals go straight back to your shell. It doesn't write to the catalog and works while the TUI is open.
 
-Оставьте `version` и `id`, созданные командой, неизменными. Для нескольких VPS можно создать отдельные шаблоны и собрать их объекты в один массив `hosts`; у каждого должен быть свой UUID. Имена могут совпадать, но тогда `connect NAME` потребует переименования.
+Use an address or SSH alias for the host, not `user@host` or a URL. Whitespace and a leading `-` are rejected. Leave user, port, or identity unset to use your OpenSSH config and agent. A saved identity path must be an absolute path or start with `~/` and point to an existing regular file; the private key itself is never imported.
 
-`import FILE` проверяет **весь** файл и добавляет записи одной операцией безопасного сохранения в pass. Уже существующие VPS и их история не заменяются и не удаляются. Совпадение UUID с текущим каталогом, повторный импорт того же файла, неизвестные поля, неверные даты/суммы или пустой список — ошибка без записи. Перед импортом закройте редактирующий TUI: используется та же блокировка каталога, проверки Git и схема pending-сохранения. При неопределённом результате не повторяйте команду вслепую; проверьте каталог через TUI и состояние pending/Git.
+Saved SSH passwords are only for manual viewing. They are never passed to SSH. The app doesn't disable host-key verification or enable agent forwarding. Extra SSH options and remote commands aren't accepted after the server name; `--` ends application option parsing.
 
-**Заполненный файл — открытый текст, в том числе пароли и финансы.** Не кладите его в password-store или Git-репозиторий. Приложение не выводит содержимое при импорте и не удаляет исходник автоматически; после подтверждённого импорта удалите файл вручную. Права `0600` ограничивают доступ, но не заменяют шифрование.
+When you connect from the TUI, it releases the terminal and resumes when SSH exits. The same happens for pass/pinentry prompts. Raw mode and mouse capture are disabled while those programs run, and mouse capture is also disabled on exit.
 
+## Import from a file
 
-## Клавиши
+If you'd rather fill in server details in an editor, start with a template:
 
-- `↑↓` — выбрать VPS; `Enter` — карточка.
-- `a` — добавить; `e` — изменить; `p` — записать оплату.
-- `s` — SSH с подтверждением; `x` — архивировать/восстановить с подтверждением.
-- `/` — поиск по имени, провайдеру или SSH-host; `Enter`/`Esc` — закончить ввод.
-- `Tab`/`Shift+Tab` — активные/архив; `r` — перечитать; `q` или `Ctrl+C` — выход.
-- В форме: клик левой кнопкой выбирает поле; колесо переключает поля и открывает скрытые на узком экране. `Tab`/`Shift+Tab` — поля и кнопки; `←→` — период; `Ctrl+S` либо кнопка «Сохранить»; `Esc` — отмена. Заметки многострочные. Поле в фокусе прокручивается в видимую область, в том числе на 80×24. При SSH/pinentry и выходе захват мыши отключается.
-- В карточке: `v` — показать/скрыть пароли, `PageUp`/`PageDown` — прокрутка, `Esc` — закрыть. После закрытия пароли снова скрыты. URL — только текст.
+```sh
+host-manager template vps.json
+# Fill in vps.json in your editor, then:
+host-manager import vps.json
+```
 
-Сумма принимает точку или одну десятичную запятую, без разделителей тысяч; валюта — три латинские буквы. Даты — строго `YYYY-MM-DD`. Следующая дата при оплате **вводится явно**, должна быть позже даты оплаты и прежнего срока. Запись оплаты не меняет тариф. Отмена ничего не сохраняет. Архив сохраняет реквизиты и историю, но не участвует в сводке; это **не отмена услуги у хостера**.
+The template is UTF-8 JSON with one server and a generated UUID. Creating it doesn't need pass or a configured store. The file gets `0600` permissions, and the command refuses to overwrite an existing file or symlink.
 
-Месячная оценка делит тариф на 1/3/6/12 для месяца/квартала/полугода/года; нестандартные периоды посчитаны отдельно как исключённые. Ближайшие платежи — по одному сроку активного VPS в следующие 30 дней включительно, просрочка отдельно. Валюты не складываются и не конвертируются. Расчёты — checked Decimal, отображение округляется до двух знаков после суммирования.
+Fill in these fields:
 
-## SSH и connect
+- `name` and `provider`.
+- `billing.amount`, as a string such as `"5.00"`, and `billing.currency`.
+- `billing.next_due`, as a date such as `"2026-12-01"`, or `null` if you don't know it yet.
+- `ssh.host`, or replace the whole SSH object with `"ssh": null` if you don't need it.
 
-`connect NAME` ищет точное регистрозависимое имя среди активных VPS и сразу заменяет процесс системным SSH, без TUI и дополнительного подтверждения. Дубли отображаемых имён разрешены, но для connect несколько активных совпадений — ошибка. `--` завершает разбор опций; после имени нельзя добавлять удалённые команды или опции SSH.
+Keep all the keys in the document. Optional credentials can stay `null`; notes are a string and an empty payment history is `[]`. Billing `period` accepts `month`, `quarter`, `half_year`, `year`, or `other`. For `other`, fill in `period_note`; otherwise leave it `null`.
 
-SSH-host — адрес или alias, без `user@host`, URL, пробелов и ведущего `-`. Неуказанные user/port/identity остаются на усмотрение OpenSSH config/agent. Файл ключа — существующий обычный файл по абсолютному пути или `~/…`; его содержимое не импортируется. Сохранённый пароль доступен только для ручного просмотра: приложение никогда не передаёт его SSH. Проверка host key не отключается, agent forwarding не включается. TUI восстанавливает терминал для SSH и pass/pinentry и возвращается после их завершения; CLI наследует exit code и сигналы SSH.
+Leave `version` and the generated `id` alone. To import several servers at once, create separate templates and combine their server objects in one `hosts` array, keeping a different UUID for each.
 
-## Сохранение и восстановление
+Import only adds entries. It doesn't replace existing servers or their history. The whole file is checked before anything is saved; unknown fields, invalid dates or amounts, an empty list, or an existing UUID will stop the import. Importing the same file again is therefore an error, not an update.
 
-Формат: JSON версии 1 внутри `<папка>/catalog.gpg`. Тарифы, история, UUID и nullable-поля типизированы; неизвестные поля/версии, неверные суммы/даты и ошибки расшифровки блокируют запись, а не превращаются в пустой каталог.
+Close the editing TUI before importing. Imports use the same lock and save checks as the TUI. You can choose another pass directory as usual:
 
-Сохранение сначала шифрует `catalog.pending.gpg` через `pass insert`, проверяет расшифрованное содержимое, затем выполняет `pass mv` в той же папке и проверяет результат. Перед изменениями проверяются hash исходного ciphertext и отсутствие staged-изменений Git. Коммиты делает pass; push/pull приложение не запускает. Если данные подтверждены, но pass/Git сообщил ошибку (в том числе оставил индекс после отказа hook), показывается предупреждение: **не записывайте ту же оплату повторно**, проверьте Git.
+```sh
+host-manager --pass-dir "$HOME/.password-store/infrastructure" import vps.json
+```
 
-Если остался `catalog.pending.gpg`, основной каталог доступен для чтения, но новые записи заблокированы. Не удаляйте pending вслепую: сравните записи средствами pass и вручную выберите нужную версию. Pending без основного — ошибка восстановления. После ручного разбора отмените незавершённую форму и нажмите `r`. Неопределённый результат сохранения блокирует повторную запись до успешной перезагрузки.
+**The completed JSON file is not encrypted.** That includes any passwords and financial details you put in it. Keep it out of your password-store and Git repositories, and delete it yourself after a confirmed import. The app doesn't print its contents or remove the source file. File permissions aren't a substitute for encryption.
 
-Редактирующий экземпляр держит OS-lock в `${XDG_CACHE_HOME:-~/.cache}/host-manager/<sha256-пути>.lock`; после аварии блокировка снимается ОС. `connect` не берёт lock и не пишет ничего, поэтому работает при открытом TUI. Не выполняйте параллельные ручные изменения каталога через pass/Git: hash-проверки не являются общей транзакцией с чужими процессами. Конфликты Git разрешаются вручную.
+## Storage and recovery
 
-Внутреннее хранилище не использует plaintext-файлы, собственную базу, clipboard, внешний редактор или открытый кэш. Исключение по явному запросу пользователя — созданный/заполненный JSON-шаблон импорта: это открытый файл, его нужно удалить вручную. Расшифрованные данные каталога остаются в памяти и на явно открытом экране; гарантированное стирание памяти не обещается. Имена файлов, `.gpg-id`, факт изменений и Git-метаданные открыты; старые зашифрованные версии остаются в Git. Ротация ключей и резервные копии — средствами pass/GPG.
+The catalog is version 1 JSON stored as `<directory>/catalog.gpg`. A bad decryption, unsupported version, unknown field, or invalid value is an error, never an empty catalog to overwrite.
 
-## Проверки
+Saves go through `catalog.pending.gpg` first: pass encrypts it, the app checks its decrypted contents, then pass moves it over the main catalog and the app checks the result. Before writing, it checks that the original ciphertext hasn't changed and that Git has no staged changes. pass makes the commits; host-manager doesn't push or pull.
 
-Тесты используют настоящие pass/GPG/Git, отдельные временные ключи/окружения и завершают только свои gpg-agent. Пользовательский password-store не используется. Проверяются деньги/даты, шифрование и Git-история, recipients, конфликты/сбои, формы через TestBackend, границы SSH-аргументов и read-only connect. Недоступные системные инструменты приводят к ошибке проверки, не к фиктивному успеху.
+If you see a warning that the data was saved but pass/Git reported an error, check Git. **Don't record the payment or import the file again.** A failed Git hook can leave changes staged even when the catalog was saved successfully.
 
-Проверено на macOS: 33 теста прошли, release собран с `--locked`. В живом PTY 80×24 проверены создание/редактирование VPS, оплата с единственным сохранённым событием, карточка и маскировка. Настоящий временный loopback sshd: CLI-shell с `exit 7` без изменений ciphertext/HEAD/индекса, SSH из TUI с возвратом после выхода и Ctrl+C; отдельно — отказ соединения с возвратом в интерфейс. На временном защищённом ключе проверены отмена pinentry при чтении и перезагрузке, отсутствие записи и восстановление терминала. Временные ключи, агенты, sshd и harness удалены. Пользовательские ключи/VPS и Linux вживую не проверялись.
+If a save result is uncertain, check the catalog and pending entry before retrying. Further writes are blocked until a successful reload.
 
-Для `template`/`import` дополнительно прошли 10 целевых CLI-тестов: права и запрет перезаписи шаблона, импорт нескольких VPS через настоящий pass, сохранность существующих данных, блокировка открытого TUI, повторные UUID, ошибочные документы и staged-изменения Git. Release пересобран; создание шаблона и отказ от незаполненного файла проверены запуском release-бинарника без пользовательского password-store.
+### A pending file was left behind
+
+With `catalog.pending.gpg` present, the main catalog stays readable but new saves are blocked. Don't just delete pending: compare the entries using pass and decide which version to keep. Pending without a main catalog also needs manual recovery; it isn't treated as a new empty store.
+
+Once you've resolved it, cancel any unfinished form and press `r` to reload.
+
+### Another process is editing the catalog
+
+Only one editing instance can open a directory at a time. Its OS lock lives at `${XDG_CACHE_HOME:-~/.cache}/host-manager/<sha256-of-path>.lock` and is released automatically after a crash. Read-only `connect` doesn't take this lock.
+
+Don't edit the catalog through pass or Git while the app is saving. The hash checks catch external changes, but they aren't a transaction shared with other programs. Git conflicts need to be resolved manually.
+
+### What encryption does and doesn't cover
+
+There are no plaintext catalog files, separate database, or unencrypted cache. The import file described above is the exception: you create it explicitly and need to delete it yourself. Decrypted data is present in memory and on screens you open; the app doesn't promise to wipe memory securely.
+
+Filenames, `.gpg-id`, and Git metadata remain visible. Older encrypted versions stay in Git history. Backups and key rotation are handled outside the app with pass/GPG.
+
+## Development
+
+```sh
+cargo +stable test --locked
+cargo +stable build --release --locked
+./target/release/host-manager
+```
+
+The tests use real pass, GPG, and Git with temporary stores and keys, not your personal password-store. They cover billing calculations, storage failures and conflicts, imports, SSH arguments, CLI behavior, and forms rendered with Ratatui's TestBackend. Missing system tools fail the tests rather than silently skipping the checks.
+
+Live terminal, pinentry, and loopback SSH checks have been run on macOS. Linux hasn't been checked interactively.
+
+If Cargo can't find `rustc` because the Rust proxies aren't in PATH, you can use the installed toolchain directly for a command:
+
+```sh
+PATH="$(dirname "$(rustup which --toolchain stable rustc)"):$PATH" \
+  rustup run stable cargo build --release --locked
+```
