@@ -282,9 +282,10 @@ impl App {
                     .find(|h| h.id == id)
                     .and_then(|h| h.ssh.as_ref())
                     .context("SSH-доступ не настроен")?;
-                let status = ssh::ssh_command(config)?
-                    .status()
-                    .context("Не удалось запустить SSH")?;
+                let status =
+                    ssh::ssh_command(config, id, self.store.directory(), self.store.environment())?
+                        .status()
+                        .context("Не удалось запустить SSH")?;
                 self.mode = Mode::List;
                 self.message = match status.code() {
                     Some(code) => format!("SSH завершён: код {code}"),
@@ -530,10 +531,19 @@ impl App {
                 let text = if ssh {
                     let config = host.ssh.as_ref().unwrap();
                     format!(
-                        "Подключиться к {}?\nАдрес: {} · пользователь: {}\nEnter — подключиться · Esc — отмена",
+                        "Подключиться к {}?\nАдрес: {} · пользователь: {}\nВход: {}\nEnter — подключиться · Esc — отмена",
                         host.name,
                         config.host,
-                        config.user.as_deref().unwrap_or("из OpenSSH config")
+                        config.user.as_deref().unwrap_or("из OpenSSH config"),
+                        if config
+                            .password
+                            .as_deref()
+                            .is_some_and(|password| !password.is_empty())
+                        {
+                            "сохранённый пароль (password-only)"
+                        } else {
+                            "настройки OpenSSH / ssh-agent"
+                        }
                     )
                 } else {
                     format!(
@@ -638,7 +648,7 @@ fn render_detail(frame: &mut Frame, area: Rect, host: &Host, reveal: bool, scrol
             Span::raw(ssh.identity_file.as_deref().unwrap_or("из OpenSSH")),
         ]));
         lines.push(Line::from(vec![
-            Span::raw("Пароль SSH (вводится вручную): "),
+            Span::raw("Пароль SSH (автовход): "),
             Span::raw(secret(ssh.password.as_deref(), reveal)),
         ]));
     } else {
@@ -728,7 +738,7 @@ const HOST_LABELS: [&str; 16] = [
     "Доступ · SSH user",
     "Доступ · SSH port",
     "Доступ · Файл SSH-ключа (абсолютный путь или ~/)",
-    "Доступ · Пароль SSH (только просмотр)",
+    "Доступ · Пароль SSH (автовход; пусто — ключи/agent)",
     "Оплата · Сумма *",
     "Оплата · Валюта *",
     "Оплата · Период (←/→)",

@@ -1,0 +1,56 @@
+#!/bin/sh
+# Disposable Linux account only. Password arrives on stdin, never argv/env/a host file.
+set -eu
+state=${2:?usage: askpass-server start|stop|logs STATE_DIRECTORY}
+case ${1:-} in
+start)
+    mkdir -p "$state"
+    chmod 700 "$state"
+    [ ! -e "$state/container" ] || { echo 'State directory is already in use' >&2; exit 1; }
+    docker info >/dev/null 2>&1 || { echo 'Real SSH check unavailable: start Docker/OrbStack first' >&2; exit 1; }
+    name="host-manager-askpass-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    docker run --rm -d --name "$name" --label host-manager.askpass-test=true \
+        -p 127.0.0.1::22 alpine:3.23 /bin/sh -c \
+        'while [ ! -f /run/ready ]; do sleep 0.1; done; exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config' > "$state/container"
+    cleanup() { docker rm -f "$name" >/dev/null 2>&1 || :; rm -f "$state/container"; }
+    trap cleanup EXIT HUP INT TERM
+    docker exec "$name" apk add --no-cache openssh-server >/dev/null
+    docker exec "$name" adduser -D -s /bin/sh hmtest
+    IFS= read -r password
+    [ -n "$password" ] || { echo 'Nonempty disposable password required on stdin' >&2; exit 1; }
+    printf 'hmtest:%s\n' "$password" | docker exec -i "$name" chpasswd
+    unset password
+    docker exec -i "$name" /bin/sh -c 'cat > /etc/ssh/sshd_config' <<'CONFIG'
+Port 22
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+PasswordAuthentication yes
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no
+AllowUsers hmtest
+StrictModes yes
+LogLevel VERBOSE
+PrintMotd no
+PidFile /run/sshd.pid
+CONFIG
+    docker exec "$name" ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key
+    docker exec -i "$name" /bin/sh -c 'cat > /home/hmtest/.profile; chown hmtest:hmtest /home/hmtest/.profile' <<'PROFILE'
+PS1='HOST_MANAGER_SSH_READY> '
+export PS1
+PROFILE
+    docker exec "$name" touch /run/ready
+    docker port "$name" 22/tcp | sed 's/^127\.0\.0\.1://' > "$state/port"
+    docker exec "$name" cat /etc/ssh/ssh_host_ed25519_key.pub > "$state/host_key.pub"
+    trap - EXIT HUP INT TERM
+    ;;
+stop)
+    if [ -f "$state/container" ]; then
+        docker rm -f "$(cat "$state/container")" >/dev/null
+        rm -f "$state/container" "$state/port" "$state/host_key.pub"
+    fi
+    ;;
+logs) docker logs "$(cat "$state/container")" 2>&1 ;;
+*) echo 'usage: askpass-server start|stop|logs STATE_DIRECTORY' >&2; exit 2 ;;
+esac

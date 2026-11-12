@@ -392,6 +392,14 @@ impl PassStore {
         })
     }
 
+    pub fn directory(&self) -> &Path {
+        &self.paths.dir
+    }
+
+    pub fn environment(&self) -> &Environment {
+        &self.env
+    }
+
     pub fn load(&mut self) -> Result<Catalog> {
         self.writable = false;
         let (catalog, baseline) = read_catalog(&self.paths, &self.env)?;

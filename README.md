@@ -108,11 +108,17 @@ host-manager connect "prod eu"
 
 The name must match exactly, including case, and identify one active server. Archived entries aren't connected to. Duplicate display names are allowed in the catalog, but you'll need to rename them if more than one active entry matches.
 
-This opens an ordinary SSH session without another application-level confirmation. SSH handles host-key checks, passwords, and key passphrases as usual. `connect` hands over the terminal to SSH, so its exit status and signals go straight back to your shell. It doesn't write to the catalog and works while the TUI is open.
+This opens an SSH session without another application-level confirmation. `connect` hands over the terminal to SSH, so its exit status and signals go straight back to your shell. It doesn't write to the catalog and works while the TUI is open.
 
-Use an address or SSH alias for the host, not `user@host` or a URL. Whitespace and a leading `-` are rejected. Leave user, port, or identity unset to use your OpenSSH config and agent. A saved identity path must be an absolute path or start with `~/` and point to an existing regular file; the private key itself is never imported.
+Use an address or SSH alias for the host, not `user@host` or a URL. Whitespace and a leading `-` are rejected. Leave user and port unset to use your OpenSSH config. A saved identity path must be an absolute path or start with `~/` and point to an existing regular file; the private key itself is never imported.
 
-Saved SSH passwords are only for manual viewing. They are never passed to SSH. The app doesn't disable host-key verification or enable agent forwarding. Extra SSH options and remote commands aren't accepted after the server name; `--` ends application option parsing.
+If `ssh.password` is empty or `null`, SSH uses your usual config, keys, and agent. If you've saved a password, both `connect` and the TUI use [SSH_ASKPASS](https://man.openbsd.org/ssh#SSH_ASKPASS_REQUIRE) to supply it. This is a password-only connection with one attempt: public-key and keyboard-interactive authentication are disabled for that connection. Clear the saved password to use keys, an agent, or keyboard-interactive/2FA instead. Saved passwords longer than 1,023 UTF-8 bytes cannot be used with askpass.
+
+The password is read from pass by a helper bound to that SSH process and server entry. It isn't put in arguments, environment variables, or temporary files. Other prompts, including host-key confirmation and password changes, stay manual; a jump host does not receive the destination's saved password. The helper may need GPG/pinentry to unlock the catalog again.
+
+Manual jump-host prompts also use the system `/bin/ps` utility to find the controlling terminal.
+
+Host-key checking stays enabled in saved-password mode: a new key needs your confirmation, and a changed key is rejected. The app doesn't enable agent forwarding. Extra SSH options and remote commands aren't accepted after the server name; `--` ends application option parsing.
 
 When you connect from the TUI, it releases the terminal and resumes when SSH exits. The same happens for pass/pinentry prompts. Raw mode and mouse capture are disabled while those programs run, and mouse capture is also disabled on exit.
 
@@ -186,6 +192,14 @@ cargo +stable build --release --locked
 ```
 
 The tests use real pass, GPG, and Git with temporary stores and keys, not your personal password-store. They cover billing calculations, storage failures and conflicts, imports, SSH arguments, CLI behavior, and forms rendered with Ratatui's TestBackend. Missing system tools fail the tests rather than silently skipping the checks.
+
+The password-login integration test also needs Docker and `expect`. Start Docker first, then run:
+
+```sh
+cargo +stable test --locked --test askpass real_password_sessions -- --ignored --nocapture
+```
+
+It creates a disposable loopback OpenSSH server and a test account inside a container, then removes them. It checks password login, key-based login without a saved password, host-key rejection, a wrong password, and jump-host isolation. The default test run leaves this Docker-dependent test ignored.
 
 Live terminal, pinentry, and loopback SSH checks have been run on macOS. Linux hasn't been checked interactively.
 

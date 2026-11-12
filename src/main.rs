@@ -11,7 +11,7 @@ use host_manager::{app::App, model, ssh, store, terminal};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-const USAGE: &str = "Использование:\n  host-manager [--pass-dir PATH]\n  host-manager [--pass-dir PATH] connect NAME [--pass-dir PATH]\n  host-manager template FILE\n  host-manager [--pass-dir PATH] import FILE\n  host-manager --help\n  host-manager COMMAND --help\n\nБез подкоманды открывается TUI. connect подключается через системный SSH.\ntemplate создаёт JSON-шаблон без перезаписи файла; import добавляет заполненные VPS в pass.\nШаблон и заполненный файл — открытый текст; удаляйте их вручную после импорта.\nПапка: --pass-dir, затем HOST_MANAGER_PASS_DIR, иначе host-manager в корне pass.\nИспользуйте -- для окончания разбора опций; имена и пути с пробелами заключайте в кавычки.";
+const USAGE: &str = "Использование:\n  host-manager [--pass-dir PATH]\n  host-manager [--pass-dir PATH] connect NAME [--pass-dir PATH]\n  host-manager template FILE\n  host-manager [--pass-dir PATH] import FILE\n  host-manager --help\n  host-manager COMMAND --help\n\nБез подкоманды открывается TUI. connect подключается через системный SSH.\nСохранённый SSH-пароль включает password-only автовход через SSH_ASKPASS; без него используются обычные настройки OpenSSH.\ntemplate создаёт JSON-шаблон без перезаписи файла; import добавляет заполненные VPS в pass.\nШаблон и заполненный файл — открытый текст; удаляйте их вручную после импорта.\nПапка: --pass-dir, затем HOST_MANAGER_PASS_DIR, иначе host-manager в корне pass.\nИспользуйте -- для окончания разбора опций; имена и пути с пробелами заключайте в кавычки.";
 
 struct Arguments {
     pass_dir: Option<PathBuf>,
@@ -184,7 +184,7 @@ fn run(arguments: Arguments) -> Result<ExitCode> {
             let catalog = store::load_catalog(&pass_dir, &env)?;
             let host = model::find_connect_host(&catalog, &name)?;
             let config = host.ssh.as_ref().context("SSH-доступ не настроен")?;
-            let mut command = ssh::ssh_command(config)?;
+            let mut command = ssh::ssh_command(config, host.id, &pass_dir, &env)?;
             drop(catalog);
             drop(env);
             drop(pass_dir);
@@ -203,7 +203,17 @@ fn run(arguments: Arguments) -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
-    let arguments = match parse_arguments(std::env::args_os().skip(1)) {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(result) = ssh::internal_command(&args) {
+        return match result {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("host-manager: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let arguments = match parse_arguments(args) {
         Ok(arguments) => arguments,
         Err(error) => {
             eprintln!("host-manager: {error}\n\n{USAGE}");

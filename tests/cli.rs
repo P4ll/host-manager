@@ -133,6 +133,7 @@ fn usage_errors_and_help_do_not_access_pass() {
         &["connect", "name", "extra"],
         &["unknown"],
         &["--unknown"],
+        &["--host-manager-ssh"],
         &["--pass-dir"],
         &["--pass-dir", ""],
         &["--pass-dir", "one", "--pass-dir", "two"],

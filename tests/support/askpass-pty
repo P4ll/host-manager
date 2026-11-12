@@ -1,0 +1,56 @@
+#!/usr/bin/expect -f
+# Environment is the isolated Fixture's. No password is accepted by this driver.
+set timeout 20
+if {$argc != 4} { puts stderr "usage: askpass-pty MODE BINARY PASS_DIRECTORY HOST_NAME"; exit 2 }
+lassign $argv mode binary directory hostname
+log_user 1
+spawn -noecho $binary --pass-dir $directory connect $hostname
+if {$mode eq "success"} {
+    expect {
+        "HOST_MANAGER_SSH_READY> " {}
+        "Are you sure you want to continue connecting" { puts stderr "Unexpected host-key prompt"; exit 91 }
+        timeout { puts stderr "Real SSH shell was not reached"; exit 92 }
+        eof { puts stderr "Real SSH exited before authentication"; exit 93 }
+    }
+    send -- "printf 'HOST_MANAGER_ASKPASS_OK\\n'; exit 7\r"
+    expect {
+        "HOST_MANAGER_ASKPASS_OK\r\n" {}
+        timeout { exit 94 }
+        eof { exit 95 }
+    }
+    expect eof
+} elseif {$mode eq "refuse-hostkey"} {
+    expect {
+        "Are you sure you want to continue connecting" { send -- "no\r" }
+        "HOST_MANAGER_SSH_READY> " { puts stderr "Host key was automatically accepted"; exit 96 }
+        timeout { puts stderr "Manual host-key confirmation was not offered"; exit 97 }
+        eof { puts stderr "SSH exited without manual host-key confirmation"; exit 98 }
+    }
+    expect eof
+} elseif {$mode eq "jump-password"} {
+    expect {
+        "hmtest@127.0.0.1's password: " { send -- "HOST_MANAGER_WRONG_JUMP_REPLY\r" }
+        "HOST_MANAGER_SSH_READY> " { puts stderr "Saved final password authenticated jump host"; exit 102 }
+        "Are you sure you want to continue connecting" { puts stderr "Unexpected jump host-key prompt"; exit 103 }
+        timeout { puts stderr "Jump password was not requested manually"; exit 104 }
+        eof { puts stderr "Jump SSH exited without a manual password prompt"; exit 105 }
+    }
+    expect {
+        "hmtest@127.0.0.1's password: " { puts stderr "Jump password was requested more than once"; exit 106 }
+        "HOST_MANAGER_SSH_READY> " { puts stderr "Wrong manual jump password authenticated"; exit 107 }
+        timeout { puts stderr "Jump authentication failure did not terminate"; exit 108 }
+        eof {}
+    }
+} elseif {$mode eq "failure"} {
+    expect {
+        "HOST_MANAGER_SSH_READY> " { puts stderr "Unexpected authentication success"; exit 99 }
+        timeout { puts stderr "SSH failure did not terminate"; exit 100 }
+        eof {}
+    }
+} else {
+    puts stderr "Unknown mode"
+    exit 2
+}
+set result [wait]
+if {[lindex $result 2] != 0} { exit 101 }
+exit [lindex $result 3]
