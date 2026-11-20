@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
 
@@ -164,6 +165,22 @@ impl Drop for Fixture {
                 .output();
         }
     }
+}
+
+pub type Ciphertexts = (Vec<u8>, BTreeMap<String, Vec<u8>>);
+
+pub fn ciphertexts(dir: &Path) -> Ciphertexts {
+    let hosts = fs::read_dir(dir.join("hosts"))
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect();
+    (fs::read(dir.join("index.gpg")).unwrap(), hosts)
 }
 
 pub fn sample_host() -> Host {

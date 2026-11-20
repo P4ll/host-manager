@@ -4,7 +4,7 @@
 
 A terminal app for keeping track of your VPS: where they're hosted, what they cost, when payment is due, and how to log in.
 
-It keeps the catalog in your existing [pass](https://www.passwordstore.org/) store and uses OpenSSH for connections. Server details, credentials, and payment history are encrypted together. There is no separate database or set of keys to manage.
+It keeps the catalog in your existing [pass](https://www.passwordstore.org/) store and uses OpenSSH for connections. Each server has its own encrypted, readable pass entry, including credentials and payment history. There is no separate database or set of keys to manage.
 
 The interface is currently in Russian. The app runs on macOS and Linux.
 
@@ -155,27 +155,28 @@ host-manager --pass-dir "$HOME/.password-store/infrastructure" import vps.json
 
 **The completed JSON file is not encrypted.** That includes any passwords and financial details you put in it. Keep it out of your password-store and Git repositories, and delete it yourself after a confirmed import. The app doesn't print its contents or remove the source file. File permissions aren't a substitute for encryption.
 
-## Storage and recovery
+## Storage, migration, and recovery
 
-The catalog is version 1 JSON stored as `<directory>/catalog.gpg`. A bad decryption, unsupported version, unknown field, or invalid value is an error, never an empty catalog to overwrite.
+Run `host-manager migrate` with the editing TUI closed, and add `--pass-dir PATH` if you use a custom directory. The first successful save or import also converts an old store. Until then, `connect` and the TUI can read the old catalog without modifying it.
 
-Saves go through `catalog.pending.gpg` first: pass encrypts it, the app checks its decrypted contents, then pass moves it over the main catalog and the app checks the result. Before writing, it checks that the original ciphertext hasn't changed and that Git has no staged changes. pass makes the commits; host-manager doesn't push or pull.
+Migration checks the old catalog and decrypts each newly encrypted entry to verify it. It publishes `index.gpg` last, after all referenced entries are in place. It never modifies or deletes the old `catalog.gpg`: keep it as a backup of the state before migration, not as a live copy. If a migration stops before the index is published, run it again; it can reuse matching entries but will not overwrite a conflicting file.
 
-If you see a warning that the data was saved but pass/Git reported an error, check Git. **Don't record the payment or import the file again.** A failed Git hook can leave changes staged even when the catalog was saved successfully.
+After migrating, use the new host-manager on all editing machines. Older versions still read and write the backup format.
 
-If a save result is uncertain, check the catalog and pending entry before retrying. Further writes are blocked until a successful reload.
+### Open one server on your phone
 
-### A pending file was left behind
+Sync the same pass Git repository to your mobile client, then open an entry under `<directory>/hosts/`. The entry's filename comes from the server's name when first saved and does not change on rename. Use a non-sensitive server name if you do not want it in Git paths.
 
-With `catalog.pending.gpg` present, the main catalog stays readable but new saves are blocked. Don't just delete pending: compare the entries using pass and decide which version to keep. Pending without a main catalog also needs manual recovery; it isn't treated as a new empty store.
+The first line is the SSH password if set, otherwise the account password or a blank line. Other fields use `key: value`, such as `host: vps.example.net`, `username: deploy`, and `port: 22`. Notes, billing, and payment history are JSON values within the same encrypted entry. The encrypted `index.gpg` maps server UUIDs to entry names. The JSON template and import format are unchanged.
 
-Once you've resolved it, cancel any unfinished form and press `r` to reload.
+### If saving fails
 
-### Another process is editing the catalog
+- An invalid, unreadable, or missing tracked entry is not treated as an empty store. Restore the expected file from Git or a backup before continuing.
+- If the old store has `catalog.pending.gpg`, compare it with `catalog.gpg` using pass and resolve it manually before migration. Do not delete the pending entry blindly.
+- If the app says data was saved locally but the Git commit was not confirmed, fix the Git issue and run `host-manager migrate` again to commit the saved entries. **Do not repeat a payment or import.** The app only commits managed entries; it never pushes or pulls.
+- After resolving an uncertain write or external change, cancel any unfinished form and press `r` to reload. Don't edit or pull the store while host-manager is saving.
 
-Only one editing instance can open a directory at a time. Its OS lock lives at `${XDG_CACHE_HOME:-~/.cache}/host-manager/<sha256-of-path>.lock` and is released automatically after a crash. Read-only `connect` doesn't take this lock.
-
-Don't edit the catalog through pass or Git while the app is saving. The hash checks catch external changes, but they aren't a transaction shared with other programs. Git conflicts need to be resolved manually.
+Editing instances that use the same cache directory take an OS lock at `${XDG_CACHE_HOME:-~/.cache}/host-manager/<sha256-of-path>.lock`. Read-only `connect` does not take the lock. Hash checks detect external changes but cannot make pass, Git, and other editors share a transaction.
 
 ### What encryption does and doesn't cover
 

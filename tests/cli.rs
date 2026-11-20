@@ -48,7 +48,7 @@ fn assert_code(output: &Output, code: i32) {
 }
 
 struct Snapshot {
-    ciphertext: Vec<u8>,
+    ciphertext: common::Ciphertexts,
     head: Vec<u8>,
     index: Vec<u8>,
 }
@@ -64,7 +64,7 @@ impl Snapshot {
             .unwrap();
         assert!(output.status.success());
         Self {
-            ciphertext: fs::read(dir.join("catalog.gpg")).unwrap(),
+            ciphertext: common::ciphertexts(dir),
             head: output.stdout,
             index: fs::read(fixture.root.join(".git/index")).unwrap(),
         }
@@ -75,6 +75,7 @@ impl Snapshot {
         assert_eq!(self.ciphertext, after.ciphertext);
         assert_eq!(self.head, after.head);
         assert_eq!(self.index, after.index);
+        assert!(!dir.join("catalog.gpg").exists());
         assert!(!dir.join("catalog.pending.gpg").exists());
     }
 }

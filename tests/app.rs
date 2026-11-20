@@ -92,14 +92,11 @@ fn real_forms_payment_cancel_archive_and_restart() {
     key(&mut app, KeyCode::Enter);
     assert!(!screen(&mut app, 120, 40).contains("PRIVATE-PANEL-PASSWORD"));
     key(&mut app, KeyCode::Esc);
-    let before = std::fs::read(fixture.dir.join("catalog.gpg")).unwrap();
+    let before = common::ciphertexts(&fixture.dir);
     key(&mut app, KeyCode::Char('p'));
     replace(&mut app, "4.50");
     key(&mut app, KeyCode::Esc);
-    assert_eq!(
-        std::fs::read(fixture.dir.join("catalog.gpg")).unwrap(),
-        before
-    );
+    assert_eq!(common::ciphertexts(&fixture.dir), before);
     key(&mut app, KeyCode::Char('p'));
     replace(&mut app, "4.50");
     for _ in 0..3 {

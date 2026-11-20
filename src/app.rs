@@ -365,7 +365,7 @@ impl App {
                 self.message = match outcome {
                     SaveOutcome::Saved => "Сохранено".into(),
                     SaveOutcome::SavedWithPassWarning => {
-                        "Данные сохранены, но pass сообщил об ошибке; проверьте Git".into()
+                        "Данные сохранены локально, но коммит не подтверждён. Проверьте Git.".into()
                     }
                 };
                 let selected = self.visible().iter().position(|h| h.id == id).unwrap_or(0);

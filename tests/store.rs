@@ -9,9 +9,9 @@ use std::{
     process::Stdio,
 };
 
-use common::{Fixture, sample_host};
+use common::{Fixture, ciphertexts, sample_host};
 use host_manager::{
-    model::Catalog,
+    model::{Catalog, Payment},
     store::{PassStore, SaveOutcome, load_catalog, resolve_pass_dir},
 };
 
@@ -41,6 +41,27 @@ fn insert(fixture: &Fixture, entry: &str, bytes: &[u8]) {
         writer.join().unwrap();
         assert!(output.status.success(), "isolated pass insertion failed");
     });
+}
+
+fn show(fixture: &Fixture, entry: &str) -> Vec<u8> {
+    fixture
+        .checked(fixture.command("pass").args(["show", "--", entry]))
+        .stdout
+}
+
+fn host_stem(fixture: &Fixture, id: uuid::Uuid) -> String {
+    let index: serde_json::Value =
+        serde_json::from_slice(&show(fixture, "host-manager/index")).unwrap();
+    assert_eq!(index["version"], 2);
+    index["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|host| host["id"] == id.to_string())
+        .unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 fn assert_no_plaintext(path: &Path, secret: &[u8]) {
@@ -74,14 +95,18 @@ fn encrypted_round_trip_git_history_and_readonly_lock() {
     assert_eq!(store.save(&catalog).unwrap(), SaveOutcome::Saved);
     assert!(PassStore::open(&fixture.dir, fixture.env.clone()).is_err());
     assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
-    let shown =
-        fixture.checked(
-            fixture
-                .command("pass")
-                .args(["show", "--", "host-manager/catalog"]),
-        );
-    let decrypted: Catalog = serde_json::from_slice(&shown.stdout).unwrap();
-    assert!(decrypted == catalog);
+    let stem = host_stem(&fixture, catalog.hosts[0].id);
+    let shown = String::from_utf8(show(&fixture, &format!("host-manager/hosts/{stem}"))).unwrap();
+    assert!(shown.lines().next().unwrap() == secret);
+    for field in [
+        "name: example-vps",
+        "provider: Example Hosting",
+        "host: 127.0.0.1",
+        "username: root",
+        "port: 22",
+    ] {
+        assert!(shown.lines().any(|line| line == field));
+    }
     assert_no_plaintext(&fixture.root, secret.as_bytes());
     let commits = fixture.checked(
         fixture
@@ -131,7 +156,8 @@ fn nested_recipients_and_missing_secret_key() {
             .args(["init", "-p", "host-manager", &second]),
     );
     let (store, catalog) = initial(&fixture);
-    let ciphertext = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
+    let before = ciphertexts(&fixture.dir);
+    let stem = host_stem(&fixture, catalog.hosts[0].id);
     let exported = fixture.checked(fixture.command("gpg").args([
         "--batch",
         "--pinentry-mode",
@@ -196,14 +222,16 @@ fn nested_recipients_and_missing_secret_key() {
             .count(),
         1
     );
-    let decrypted = fixture.checked(
-        fixture
-            .command("gpg")
-            .env("GNUPGHOME", keyring.path())
-            .args(["--batch", "--decrypt"])
-            .arg(fixture.dir.join("catalog.gpg")),
-    );
-    assert!(serde_json::from_slice::<Catalog>(&decrypted.stdout).unwrap() == catalog);
+    for entry in ["index".to_owned(), format!("hosts/{stem}")] {
+        let decrypted = fixture.checked(
+            fixture
+                .command("gpg")
+                .env("GNUPGHOME", keyring.path())
+                .args(["--batch", "--decrypt"])
+                .arg(fixture.dir.join(format!("{entry}.gpg"))),
+        );
+        assert!(decrypted.stdout == show(&fixture, &format!("host-manager/{entry}")));
+    }
     let empty = tempfile::Builder::new()
         .prefix("hm-empty-")
         .tempdir_in("/tmp")
@@ -220,16 +248,17 @@ fn nested_recipients_and_missing_secret_key() {
     let mut editor = PassStore::open(&fixture.dir, no_key).unwrap();
     assert!(editor.load().is_err());
     assert!(editor.save(&catalog).is_err());
-    assert_eq!(
-        fs::read(fixture.dir.join("catalog.gpg")).unwrap(),
-        ciphertext
-    );
+    assert_eq!(ciphertexts(&fixture.dir), before);
 }
 
 #[test]
 fn corrupt_unknown_and_invalid_documents_never_enable_writes() {
     let fixture = Fixture::new();
-    let (mut store, catalog) = initial(&fixture);
+    let catalog = Catalog {
+        version: 1,
+        hosts: vec![sample_host()],
+    };
+    let mut store = PassStore::open(&fixture.dir, fixture.env.clone()).unwrap();
     let valid = String::from_utf8(serde_json::to_vec(&catalog).unwrap()).unwrap();
     for invalid in [
         "{broken JSON".to_owned(),
@@ -267,28 +296,26 @@ fn corrupt_unknown_and_invalid_documents_never_enable_writes() {
 fn external_ciphertext_conflict_preserves_external_change() {
     let fixture = Fixture::new();
     let (mut store, mut catalog) = initial(&fixture);
-    let mut external = Catalog::default();
-    let mut host = sample_host();
-    host.name = "external".into();
-    external.hosts.push(host);
-    insert(
-        &fixture,
-        "host-manager/catalog",
-        &serde_json::to_vec(&external).unwrap(),
-    );
-    let before = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
+    let stem = host_stem(&fixture, catalog.hosts[0].id);
+    let entry = format!("host-manager/hosts/{stem}");
+    let external = String::from_utf8(show(&fixture, &entry))
+        .unwrap()
+        .replace("provider: Example Hosting", "provider: External Hosting");
+    insert(&fixture, &entry, external.as_bytes());
+    let after_external_write = ciphertexts(&fixture.dir);
     catalog.hosts[0].notes = "local change".into();
     assert!(store.save(&catalog).is_err());
-    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), before);
-    assert!(!fixture.dir.join("catalog.pending.gpg").exists());
-    assert!(store.load().unwrap() == external);
+    assert_eq!(ciphertexts(&fixture.dir), after_external_write);
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.hosts[0].provider, "External Hosting");
+    assert!(loaded.hosts[0].notes.is_empty());
 }
 
 #[test]
 fn staged_unrelated_file_is_not_committed() {
     let fixture = Fixture::new();
     let (mut store, mut catalog) = initial(&fixture);
-    let before = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
+    let before = ciphertexts(&fixture.dir);
     let head = fixture
         .checked(
             fixture
@@ -308,7 +335,7 @@ fn staged_unrelated_file_is_not_committed() {
     );
     catalog.hosts[0].notes = "changed".into();
     assert!(store.save(&catalog).is_err());
-    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), before);
+    assert_eq!(ciphertexts(&fixture.dir), before);
     assert_eq!(
         fixture
             .checked(
@@ -327,13 +354,195 @@ fn staged_unrelated_file_is_not_committed() {
         "--name-only",
     ]));
     assert_eq!(staged.stdout, b"unrelated\n");
-    assert!(!fixture.dir.join("catalog.pending.gpg").exists());
+    assert!(!fixture.dir.join("catalog.gpg").exists());
+}
+
+#[test]
+fn git_hook_failure_warns_after_persisting_update() {
+    let fixture = Fixture::new();
+    let (mut store, mut catalog) = initial(&fixture);
+    let git = |args: &[&str]| {
+        fixture
+            .checked(
+                fixture
+                    .command("git")
+                    .arg("-C")
+                    .arg(&fixture.root)
+                    .args(args),
+            )
+            .stdout
+    };
+    let head = git(&["rev-parse", "HEAD"]);
+    let hooks = fixture.temp.path().join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    git(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    catalog.hosts[0].notes = "saved despite rejected commit".into();
+    assert_eq!(
+        store.save(&catalog).unwrap(),
+        SaveOutcome::SavedWithPassWarning
+    );
+    assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    fs::remove_file(hook).unwrap();
+    let saved = store.load().unwrap();
+    assert_eq!(store.save(&saved).unwrap(), SaveOutcome::Saved);
+    assert_ne!(git(&["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn cli_migrates_legacy_and_subsequent_edit_only_updates_the_selected_host() {
+    let fixture = Fixture::new();
+    let mut host = sample_host();
+    host.account_password = Some("panel-password".into());
+    host.account_login = Some("panel-user".into());
+    host.panel_url = Some("https://example.invalid/panel".into());
+    host.archived = true;
+    host.notes = "line one\nстрока два".into();
+    let identity = fixture.temp.path().join("example-key");
+    fs::write(&identity, b"test identity").unwrap();
+    let ssh = host.ssh.as_mut().unwrap();
+    ssh.password = Some("ssh-password".into());
+    ssh.identity_file = Some(identity.to_str().unwrap().into());
+    let next_due = host.billing.next_due.unwrap();
+    host.payments.push(Payment {
+        paid_on: chrono::Local::now().date_naive(),
+        amount: host.billing.amount,
+        currency: host.billing.currency.clone(),
+        next_due,
+    });
+    let mut other = sample_host();
+    other.ssh = None;
+    let mut catalog = Catalog {
+        version: 1,
+        hosts: vec![host, other],
+    };
+    insert(
+        &fixture,
+        "host-manager/catalog",
+        &serde_json::to_vec(&catalog).unwrap(),
+    );
+    let legacy = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
+    assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
+    let cli = || {
+        let mut command = fixture.command(env!("CARGO_BIN_EXE_host-manager"));
+        command.arg("--pass-dir").arg(&fixture.dir);
+        command
+    };
+    let connect = cli()
+        .args(["connect", &catalog.hosts[0].name])
+        .output()
+        .unwrap();
+    assert_eq!(connect.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&connect.stderr).contains("SSH-доступ не настроен"));
+    assert!(!fixture.dir.join("index.gpg").exists());
+    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), legacy);
+
+    fixture.checked(cli().arg("migrate"));
+    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), legacy);
+    assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
+    let selected = host_stem(&fixture, catalog.hosts[0].id);
+    let shown = show(&fixture, &format!("host-manager/hosts/{selected}"));
+    assert!(shown.starts_with(b"ssh-password\n"));
+    let other = host_stem(&fixture, catalog.hosts[1].id);
+    assert_ne!(selected, other);
+
+    let mut store = PassStore::open(&fixture.dir, fixture.env.clone()).unwrap();
+    assert!(store.load().unwrap() == catalog);
+    let before = ciphertexts(&fixture.dir);
+    catalog.hosts[0].notes.push_str("\nupdated");
+    assert_eq!(store.save(&catalog).unwrap(), SaveOutcome::Saved);
+    let after = ciphertexts(&fixture.dir);
+    assert_eq!(before.0, after.0);
+    assert_eq!(
+        before.1[&format!("{other}.gpg")],
+        after.1[&format!("{other}.gpg")]
+    );
+    assert_ne!(
+        before.1[&format!("{selected}.gpg")],
+        after.1[&format!("{selected}.gpg")]
+    );
+    let committed = fixture.checked(fixture.command("git").arg("-C").arg(&fixture.root).args([
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "HEAD",
+    ]));
+    assert_eq!(
+        committed.stdout,
+        format!("host-manager/hosts/{selected}.gpg\n").into_bytes()
+    );
+    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), legacy);
+    assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
+
+    fs::remove_file(fixture.dir.join("index.gpg")).unwrap();
+    assert!(load_catalog(&fixture.dir, &fixture.env).is_err());
+    assert!(store.load().is_err());
+    assert!(store.save(&catalog).is_err());
+    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), legacy);
+}
+
+#[test]
+fn first_write_finishes_interrupted_migration_without_hiding_legacy() {
+    let fixture = Fixture::new();
+    let mut catalog = Catalog {
+        version: 1,
+        hosts: vec![sample_host()],
+    };
+    insert(
+        &fixture,
+        "host-manager/catalog",
+        &serde_json::to_vec(&catalog).unwrap(),
+    );
+    let legacy = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
+    // Seed a real encrypted host as if migration stopped before publishing the index.
+    let staging = fixture.root.join("other-namespace");
+    let mut seed = PassStore::open(&staging, fixture.env.clone()).unwrap();
+    seed.load().unwrap();
+    assert_eq!(seed.save(&catalog).unwrap(), SaveOutcome::Saved);
+    drop(seed);
+    fs::create_dir(fixture.dir.join("hosts")).unwrap();
+    let encrypted = fs::read_dir(staging.join("hosts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    fs::copy(
+        encrypted.path(),
+        fixture.dir.join("hosts").join(encrypted.file_name()),
+    )
+    .unwrap();
+
+    let mut store = PassStore::open(&fixture.dir, fixture.env.clone()).unwrap();
+    assert!(store.load().unwrap() == catalog);
+    assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
+    assert!(!fixture.dir.join("index.gpg").exists());
+    let mut added = sample_host();
+    added.name = "added-on-first-write".into();
+    catalog.hosts.push(added);
+    assert_eq!(store.save(&catalog).unwrap(), SaveOutcome::Saved);
+    assert!(fixture.dir.join("index.gpg").is_file());
+    assert!(load_catalog(&fixture.dir, &fixture.env).unwrap() == catalog);
+    assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), legacy);
 }
 
 #[test]
 fn failed_encryption_and_pending_recovery_preserve_catalog() {
     let fixture = Fixture::new();
-    let (mut store, mut catalog) = initial(&fixture);
+    let mut catalog = Catalog {
+        version: 1,
+        hosts: vec![sample_host()],
+    };
+    insert(
+        &fixture,
+        "host-manager/catalog",
+        &serde_json::to_vec(&catalog).unwrap(),
+    );
+    let mut store = PassStore::open(&fixture.dir, fixture.env.clone()).unwrap();
+    assert!(store.load().unwrap() == catalog);
     let original = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
     fs::write(
         fixture.dir.join(".gpg-id"),
@@ -343,12 +552,15 @@ fn failed_encryption_and_pending_recovery_preserve_catalog() {
     catalog.hosts[0].notes = "must not replace the original".into();
     assert!(store.save(&catalog).is_err());
     assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), original);
+    assert!(!fixture.dir.join("index.gpg").exists());
+    assert!(
+        load_catalog(&fixture.dir, &fixture.env).unwrap().hosts[0]
+            .notes
+            .is_empty()
+    );
     fs::remove_file(fixture.dir.join(".gpg-id")).unwrap();
     drop(store);
     // A real encrypted leftover emulates interruption after pending was committed.
-    if fixture.dir.join("catalog.pending.gpg").exists() {
-        fs::remove_file(fixture.dir.join("catalog.pending.gpg")).unwrap();
-    }
     insert(
         &fixture,
         "host-manager/catalog.pending",
@@ -360,6 +572,7 @@ fn failed_encryption_and_pending_recovery_preserve_catalog() {
     assert_ne!(readable.hosts[0].notes, catalog.hosts[0].notes);
     assert!(reopened.save(&catalog).is_err());
     assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), original);
+    assert!(!fixture.dir.join("index.gpg").exists());
     assert_eq!(
         fs::read(fixture.dir.join("catalog.pending.gpg")).unwrap(),
         pending

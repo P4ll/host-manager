@@ -36,7 +36,7 @@ fn save(fixture: &Fixture, host: Host) {
 }
 
 struct Snapshot {
-    ciphertext: Vec<u8>,
+    ciphertext: common::Ciphertexts,
     head: Vec<u8>,
     index: Vec<u8>,
 }
@@ -51,7 +51,7 @@ impl Snapshot {
                 .args(["rev-parse", "HEAD"]),
         );
         Self {
-            ciphertext: fs::read(fixture.dir.join("catalog.gpg")).unwrap(),
+            ciphertext: common::ciphertexts(&fixture.dir),
             head: output.stdout,
             index: fs::read(fixture.root.join(".git/index")).unwrap(),
         }
@@ -62,6 +62,7 @@ impl Snapshot {
         assert_eq!(self.ciphertext, after.ciphertext);
         assert_eq!(self.head, after.head);
         assert_eq!(self.index, after.index);
+        assert!(!fixture.dir.join("catalog.gpg").exists());
         assert!(!fixture.dir.join("catalog.pending.gpg").exists());
     }
 }
@@ -559,4 +560,3 @@ fn real_password_sessions_preserve_hostkeys_secrets_and_store() {
     no_plaintext_history(&fixture, &password);
     no_plaintext_history(&fixture, &wrong);
 }
-

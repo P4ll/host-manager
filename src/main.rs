@@ -11,7 +11,7 @@ use host_manager::{app::App, model, ssh, store, terminal};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-const USAGE: &str = "Использование:\n  host-manager [--pass-dir PATH]\n  host-manager [--pass-dir PATH] connect NAME [--pass-dir PATH]\n  host-manager template FILE\n  host-manager [--pass-dir PATH] import FILE\n  host-manager --help\n  host-manager COMMAND --help\n\nБез подкоманды открывается TUI. connect подключается через системный SSH.\nСохранённый SSH-пароль включает password-only автовход через SSH_ASKPASS; без него используются обычные настройки OpenSSH.\ntemplate создаёт JSON-шаблон без перезаписи файла; import добавляет заполненные VPS в pass.\nШаблон и заполненный файл — открытый текст; удаляйте их вручную после импорта.\nПапка: --pass-dir, затем HOST_MANAGER_PASS_DIR, иначе host-manager в корне pass.\nИспользуйте -- для окончания разбора опций; имена и пути с пробелами заключайте в кавычки.";
+const USAGE: &str = "Использование:\n  host-manager [--pass-dir PATH]\n  host-manager [--pass-dir PATH] connect NAME [--pass-dir PATH]\n  host-manager template FILE\n  host-manager [--pass-dir PATH] import FILE\n  host-manager [--pass-dir PATH] migrate\n  host-manager --help\n  host-manager COMMAND --help\n\nБез подкоманды открывается TUI. connect подключается через системный SSH.\nСохранённый SSH-пароль включает password-only автовход через SSH_ASKPASS; без него используются обычные настройки OpenSSH.\ntemplate создаёт JSON-шаблон без перезаписи файла; import добавляет заполненные VPS в pass.\nmigrate переносит каталог в отдельные записи pass, не изменяя исходный файл.\nШаблон и заполненный файл — открытый текст; удаляйте их вручную после импорта.\nПапка: --pass-dir, затем HOST_MANAGER_PASS_DIR, иначе host-manager в корне pass.\nИспользуйте -- для окончания разбора опций; имена и пути с пробелами заключайте в кавычки.";
 
 struct Arguments {
     pass_dir: Option<PathBuf>,
@@ -23,6 +23,7 @@ enum Action {
     Connect(String),
     Template(PathBuf),
     Import(PathBuf),
+    Migrate,
     Help,
 }
 
@@ -59,10 +60,14 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<Arguments
         [] if help => Action::Help,
         [] => Action::Tui,
         [command]
-            if help && (command == "connect" || command == "template" || command == "import") =>
+            if help
+                && ["connect", "template", "import", "migrate"]
+                    .iter()
+                    .any(|c| command == c) =>
         {
             Action::Help
         }
+        [command] if command == "migrate" => Action::Migrate,
         [command, name] if command == "connect" && !help => {
             let name = name.to_str().context("Имя VPS должно быть в UTF-8")?;
             if name.is_empty() || name.chars().any(char::is_control) {
@@ -154,7 +159,7 @@ fn import_file(path: &Path, pass_dir: &Path, env: store::Environment) -> Result<
     println!("Импортировано VPS: {count}. Исходный открытый файл не удалён.");
     if outcome == store::SaveOutcome::SavedWithPassWarning {
         eprintln!(
-            "Данные сохранены, но pass/Git сообщил об ошибке; проверьте Git. Не повторяйте импорт."
+            "Данные сохранены локально, но коммит не подтверждён. Проверьте Git. Не повторяйте импорт."
         );
     }
     Ok(())
@@ -196,6 +201,21 @@ fn run(arguments: Arguments) -> Result<ExitCode> {
         }
         Action::Import(path) => {
             import_file(&path, &pass_dir, env)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Action::Migrate => {
+            let mut store = store::PassStore::open(&pass_dir, env)?;
+            let catalog = store.load()?;
+            match store.save(&catalog)? {
+                store::SaveOutcome::Saved => {
+                    println!("Записи VPS проверены и сохранены в pass и Git.");
+                }
+                store::SaveOutcome::SavedWithPassWarning => {
+                    eprintln!(
+                        "Записи VPS сохранены локально, но коммит не подтверждён. Проверьте Git."
+                    );
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Action::Help | Action::Template(_) => unreachable!(),
@@ -299,6 +319,7 @@ mod tests {
             vec!["connect", "--help"],
             vec!["template", "--help"],
             vec!["import", "--help"],
+            vec!["migrate", "--help"],
         ] {
             assert!(matches!(parse(&args).unwrap().action, Action::Help));
         }

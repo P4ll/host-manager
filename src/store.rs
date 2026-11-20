@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -12,9 +12,61 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, bail, ensure};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::{Builder, TempDir};
+use uuid::Uuid;
 
 use crate::model::Catalog;
+
+#[path = "store_format.rs"]
+mod format;
+
+const LEGACY: &str = "catalog.gpg";
+const PENDING: &str = "catalog.pending.gpg";
+const INDEX: &str = "index.gpg";
+const HOSTS: &str = "hosts";
+
+type Hash = [u8; 32];
+
+#[derive(Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Index {
+    version: u32,
+    hosts: Vec<Entry>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    id: Uuid,
+    name: String,
+}
+
+impl Entry {
+    fn file(&self) -> PathBuf {
+        Path::new(HOSTS).join(format!("{}.gpg", self.name))
+    }
+}
+
+#[derive(Default)]
+struct Snapshot {
+    index: Option<Index>,
+    files: BTreeMap<PathBuf, Option<Hash>>,
+    hosts: HashMap<Uuid, Hash>,
+}
+
+impl Snapshot {
+    fn check(&self, paths: &Paths) -> Result<()> {
+        for (file, before) in &self.files {
+            ensure!(
+                paths.hash(file)? == *before,
+                "Хранилище изменено извне; повторите загрузку перед сохранением"
+            );
+        }
+        Ok(())
+    }
+}
 
 pub type Environment = BTreeMap<OsString, OsString>;
 
@@ -27,15 +79,14 @@ pub enum SaveOutcome {
 struct Paths {
     root: PathBuf,
     dir: PathBuf,
-    namespace: PathBuf,
+    repo_dir: PathBuf,
 }
 
 pub struct PassStore {
     paths: Paths,
     env: Environment,
     _lock: File,
-    baseline: Option<[u8; 32]>,
-    writable: bool,
+    snapshot: Option<Snapshot>,
 }
 
 fn home(env: &Environment) -> Result<PathBuf> {
@@ -141,7 +192,9 @@ fn git(env: &Environment, dir: &Path) -> Command {
     ] {
         command.env_remove(key);
     }
-    command.arg("-C").arg(dir);
+    command
+        .args(["--literal-pathspecs", "--no-optional-locks", "-C"])
+        .arg(dir);
     command
 }
 
@@ -202,10 +255,6 @@ impl Paths {
             Err(_) => chosen,
         };
         let existing = check_directory_chain(&root, &dir)?;
-        let namespace = dir
-            .strip_prefix(&root)
-            .map_err(|_| anyhow!("Папка вне корня pass"))?
-            .to_path_buf();
         env.insert("PASSWORD_STORE_DIR".into(), root.as_os_str().to_owned());
         env.insert(
             "GIT_CEILING_DIRECTORIES".into(),
@@ -219,68 +268,78 @@ impl Paths {
             repo.status.success() && repo.stdout == b"true\n",
             "Для папки pass требуется существующий Git-репозиторий"
         );
-        if !env
-            .get(OsStr::new("PASSWORD_STORE_KEY"))
-            .is_some_and(|value| !value.is_empty())
-        {
-            let mut current = dir.as_path();
-            loop {
-                let recipients = current.join(".gpg-id");
-                match fs::symlink_metadata(&recipients) {
-                    Ok(meta) => {
-                        ensure!(
-                            meta.is_file() && !meta.file_type().is_symlink(),
-                            "Некорректный файл recipients pass"
-                        );
-                        let bytes = fs::read(&recipients)
-                            .map_err(|_| anyhow!("Не удалось прочитать recipients pass"))?;
-                        ensure!(
-                            bytes.iter().any(|byte| !byte.is_ascii_whitespace()),
-                            "Файл recipients pass пуст"
-                        );
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => bail!("Не удалось проверить recipients pass"),
-                }
-                ensure!(
-                    current != root,
-                    "Не настроены recipients pass: требуется .gpg-id или PASSWORD_STORE_KEY"
-                );
-                current = current
-                    .parent()
-                    .ok_or_else(|| anyhow!("Не настроены recipients pass"))?;
-            }
-        }
+        recipients(&root, &dir, env)?;
         let paths = Self {
             root,
             dir,
-            namespace,
+            repo_dir: existing,
         };
-        paths.check_files()?;
+        for file in [INDEX, LEGACY, PENDING] {
+            file_state(&paths.dir.join(file))?;
+        }
         Ok(paths)
     }
 
-    fn check_files(&self) -> Result<()> {
-        check_directory_chain(&self.root, &self.dir)?;
-        file_state(&self.catalog())?;
-        file_state(&self.pending())?;
-        Ok(())
+    fn check_parent(&self, file: &Path) -> Result<PathBuf> {
+        let parent = self.dir.join(file.parent().expect("relative entry path"));
+        check_directory_chain(&self.root, &parent)?;
+        Ok(parent)
     }
 
-    fn catalog(&self) -> PathBuf {
-        self.dir.join("catalog.gpg")
+    fn hash(&self, file: &Path) -> Result<Option<Hash>> {
+        self.check_parent(file)?;
+        ciphertext_hash(&self.dir.join(file))
     }
-    fn pending(&self) -> PathBuf {
-        self.dir.join("catalog.pending.gpg")
+
+    fn require_new_file(&self, file: &Path, env: &Environment) -> Result<()> {
+        let status = git(env, &self.repo_dir)
+            .args(["status", "--porcelain=v1", "--untracked-files=no", "--"])
+            .arg(self.dir.join(file))
+            .output()
+            .map_err(|_| anyhow!("Не удалось проверить состояние каталога в Git"))?;
+        ensure!(
+            status.status.success() && status.stdout.is_empty(),
+            "Файл хранилища отсутствует в рабочей копии; восстановите его из Git"
+        );
+        Ok(())
     }
-    fn entry(&self, pending: bool) -> PathBuf {
-        self.namespace.join(if pending {
-            "catalog.pending"
-        } else {
-            "catalog"
-        })
+}
+
+fn recipients(root: &Path, mut dir: &Path, env: &Environment) -> Result<Option<PathBuf>> {
+    if env
+        .get(OsStr::new("PASSWORD_STORE_KEY"))
+        .is_some_and(|v| !v.is_empty())
+    {
+        return Ok(None);
     }
+    loop {
+        let file = dir.join(".gpg-id");
+        match fs::symlink_metadata(&file) {
+            Ok(meta) => {
+                ensure!(meta.is_file(), "Некорректный файл recipients pass");
+                let bytes =
+                    fs::read(&file).map_err(|_| anyhow!("Не удалось прочитать recipients pass"))?;
+                ensure!(
+                    bytes.iter().any(|byte| !byte.is_ascii_whitespace()),
+                    "Файл recipients pass пуст"
+                );
+                return Ok(Some(file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("Не удалось проверить recipients pass"),
+        }
+        ensure!(
+            dir != root,
+            "Не настроены recipients pass: требуется .gpg-id или PASSWORD_STORE_KEY"
+        );
+        dir = dir
+            .parent()
+            .ok_or_else(|| anyhow!("Не настроены recipients pass"))?;
+    }
+}
+
+fn digest(bytes: &[u8]) -> Hash {
+    Sha256::digest(bytes).into()
 }
 
 fn ciphertext_hash(path: &Path) -> Result<Option<[u8; 32]>> {
@@ -303,47 +362,344 @@ fn ciphertext_hash(path: &Path) -> Result<Option<[u8; 32]>> {
     Ok(Some(hasher.finalize().into()))
 }
 
-fn read_output(paths: &Paths, env: &Environment, pending: bool) -> Result<Vec<u8>> {
-    paths.check_files()?;
+fn pass_show(env: &Environment, root: &Path, entry: &Path) -> Result<Vec<u8>> {
     let output = command("pass", env)
+        .env("PASSWORD_STORE_DIR", root)
         .args(["show", "--"])
-        .arg(paths.entry(pending))
+        .arg(entry)
         .output()
         .map_err(|_| anyhow!("Не удалось запустить pass для чтения"))?;
     ensure!(
         output.status.success(),
-        "Не удалось расшифровать каталог через pass"
+        "Не удалось расшифровать запись через pass"
     );
     Ok(output.stdout)
 }
 
-fn read_entry(paths: &Paths, env: &Environment, pending: bool) -> Result<Catalog> {
-    let bytes = read_output(paths, env, pending)?;
-    let catalog: Catalog = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow!("Некорректный JSON или формат каталога; запись запрещена"))?;
+fn read_entry(paths: &Paths, env: &Environment, file: &Path) -> Result<Vec<u8>> {
+    let entry = paths
+        .dir
+        .strip_prefix(&paths.root)
+        .expect("known pass namespace")
+        .join(file.with_extension(""));
+    pass_show(env, &paths.root, &entry)
+}
+
+fn safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && name.chars().all(|c| c.is_alphanumeric() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+}
+
+fn read_catalog(paths: &Paths, env: &Environment) -> Result<(Catalog, Snapshot)> {
+    let mut snapshot = Snapshot::default();
+    let index_path = Path::new(INDEX);
+    let index_hash = paths.hash(index_path)?;
+    snapshot.files.insert(index_path.into(), index_hash);
+    let catalog = if index_hash.is_some() {
+        let index: Index = serde_json::from_slice(&read_entry(paths, env, index_path)?)
+            .map_err(|_| anyhow!("Некорректный индекс хранилища"))?;
+        ensure!(index.version == 2, "Неизвестная версия индекса хранилища");
+        let mut catalog = Catalog::default();
+        let mut names = HashSet::with_capacity(index.hosts.len());
+        for entry in &index.hosts {
+            ensure!(
+                safe_name(&entry.name) && names.insert(&entry.name),
+                "Некорректный или повторяющийся путь в индексе хранилища"
+            );
+            let file = entry.file();
+            let hash = paths.hash(&file)?;
+            ensure!(
+                hash.is_some(),
+                "Запись VPS из индекса отсутствует; запись запрещена"
+            );
+            let host = format::decode(entry.id, &read_entry(paths, env, &file)?)?;
+            snapshot
+                .hosts
+                .insert(entry.id, digest(&format::encode(&host)?));
+            snapshot.files.insert(file, hash);
+            catalog.hosts.push(host);
+        }
+        snapshot.index = Some(index);
+        catalog
+    } else {
+        // A missing tracked index is damage, not a request to fall back to the old backup.
+        paths.require_new_file(index_path, env)?;
+        let legacy = Path::new(LEGACY);
+        let before = paths.hash(legacy)?;
+        snapshot.files.insert(legacy.into(), before);
+        let pending = Path::new(PENDING);
+        let pending_hash = paths.hash(pending)?;
+        snapshot.files.insert(pending.into(), pending_hash);
+        if before.is_some() {
+            serde_json::from_slice(&read_entry(paths, env, legacy)?)
+                .map_err(|_| anyhow!("Некорректный JSON или формат каталога; запись запрещена"))?
+        } else {
+            paths.require_new_file(legacy, env)?;
+            ensure!(
+                pending_hash.is_none(),
+                "Основной каталог отсутствует, но есть catalog.pending.gpg; требуется ручное восстановление через pass"
+            );
+            Catalog::default()
+        }
+    };
     catalog
         .validate()
         .map_err(|_| anyhow!("Каталог не прошёл проверку; запись запрещена"))?;
-    Ok(catalog)
+    snapshot.check(paths)?;
+    Ok((catalog, snapshot))
 }
 
-fn read_catalog(paths: &Paths, env: &Environment) -> Result<(Catalog, Option<[u8; 32]>)> {
-    paths.check_files()?;
-    let before = ciphertext_hash(&paths.catalog())?;
-    let catalog = if before.is_some() {
-        read_entry(paths, env, false)?
-    } else {
-        ensure!(
-            !file_state(&paths.pending())?,
-            "Основной каталог отсутствует, но есть catalog.pending.gpg; требуется ручное восстановление через pass"
-        );
-        Catalog::default()
-    };
+fn encrypt_entry(
+    env: &Environment,
+    tmp: &TempDir,
+    recipients: Option<&Path>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    for file in [".gpg-id", ".gpg-id.sig"] {
+        let dest = tmp.path().join(file);
+        if let Some(id) = recipients {
+            let source = id.with_file_name(file);
+            if file_state(&source)? {
+                fs::copy(source, dest)
+                    .map_err(|_| anyhow!("Не удалось подготовить recipients pass"))?;
+                continue;
+            }
+        }
+        if dest.exists() {
+            fs::remove_file(dest).map_err(|_| anyhow!("Не удалось сменить recipients pass"))?;
+        }
+    }
+    let mut child = command("pass", env)
+        .env("PASSWORD_STORE_DIR", tmp.path())
+        .args(["insert", "--multiline", "--force", "--", name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| anyhow!("Не удалось запустить pass для сохранения"))?;
+    let mut stdin = child.stdin.take().expect("piped pass stdin");
+    let output: Output = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(bytes));
+        let output = child.wait_with_output();
+        writer
+            .join()
+            .map_err(|_| anyhow!("Не удалось передать запись в pass"))?
+            .map_err(|_| anyhow!("Не удалось записать данные в pass"))?;
+        output.map_err(|_| anyhow!("Не удалось дождаться pass"))
+    })?;
     ensure!(
-        before == ciphertext_hash(&paths.catalog())?,
-        "Каталог изменён извне; повторите загрузку"
+        output.status.success(),
+        "pass не подтвердил шифрование записи"
     );
-    Ok((catalog, before))
+    let file = tmp.path().join(format!("{name}.gpg"));
+    ensure!(
+        file_state(&file)? && pass_show(env, tmp.path(), Path::new(name))? == bytes,
+        "Сохранённая запись не прошла проверку расшифровки"
+    );
+    File::open(&file)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| anyhow!("Не удалось сбросить зашифрованную запись на диск"))?;
+    Ok(file)
+}
+
+fn entry_name(name: &str, id: Uuid, taken: &HashSet<String>) -> String {
+    let mut base = String::new();
+    for c in name.chars().flat_map(char::to_lowercase) {
+        let c = if c.is_alphanumeric() { c } else { '-' };
+        if base.len() + c.len_utf8() > 64 {
+            break;
+        }
+        if c != '-' || (!base.is_empty() && !base.ends_with('-')) {
+            base.push(c);
+        }
+    }
+    let base = base.trim_end_matches('-');
+    if base.is_empty() {
+        id.to_string()
+    } else if taken.contains(base) {
+        format!("{base}-{}", id.simple())
+    } else {
+        base.to_owned()
+    }
+}
+
+fn commit_entries(paths: &Paths, env: &Environment, files: &[PathBuf]) -> bool {
+    let relative = |file: &PathBuf| paths.dir.join(file);
+    let status = || {
+        git(env, &paths.repo_dir)
+            .args([
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--no-renames",
+                "-z",
+                "--",
+            ])
+            .args(files.iter().map(relative))
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    };
+    if files.is_empty() || status().is_some_and(|output| output.stdout.is_empty()) {
+        return true;
+    }
+    // -N makes new paths eligible for --only without staging their contents.
+    let added = git(env, &paths.repo_dir)
+        .args(["add", "--intent-to-add", "--"])
+        .args(files.iter().map(relative))
+        .output();
+    if !added.is_ok_and(|output| output.status.success()) {
+        return false;
+    }
+    let mut commit = git(env, &paths.repo_dir);
+    commit.args(["commit", "--only", "-m", "Update host-manager entries"]);
+    if git(env, &paths.repo_dir)
+        .args(["config", "--bool", "--get", "pass.signcommits"])
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"true\n")
+    {
+        commit.arg("-S");
+    }
+    commit
+        .arg("--")
+        .args(files.iter().map(relative))
+        .output()
+        .is_ok_and(|output| output.status.success())
+        && status().is_some_and(|output| output.stdout.is_empty())
+}
+
+fn publish(
+    paths: &Paths,
+    env: &Environment,
+    before: &Snapshot,
+    catalog: &Catalog,
+) -> Result<Snapshot> {
+    let by_id: HashMap<_, _> = before
+        .index
+        .iter()
+        .flat_map(|index| &index.hosts)
+        .map(|entry| (entry.id, entry))
+        .collect();
+    let mut taken: HashSet<_> = by_id.values().map(|entry| entry.name.clone()).collect();
+    let mut index = Index {
+        version: 2,
+        hosts: Vec::with_capacity(catalog.hosts.len()),
+    };
+    let mut after = Snapshot::default();
+    let mut writes = Vec::new();
+    for host in &catalog.hosts {
+        let entry = match by_id.get(&host.id) {
+            Some(entry) => (*entry).clone(),
+            None => {
+                let name = entry_name(&host.name, host.id, &taken);
+                ensure!(taken.insert(name.clone()), "Повторяющийся путь записи VPS");
+                Entry { id: host.id, name }
+            }
+        };
+        let bytes = format::encode(host)?;
+        let hash = digest(&bytes);
+        let file = entry.file();
+        if before.hosts.get(&entry.id) == Some(&hash) {
+            after.files.insert(file.clone(), before.files[&file]);
+        } else {
+            let prior = paths.hash(&file)?;
+            if let Some(expected) = before.files.get(&file) {
+                ensure!(prior == *expected, "Запись VPS изменена извне");
+                writes.push((file, prior, bytes));
+            } else if let Some(prior) = prior {
+                // Reuse only an identical entry left before the index was published.
+                ensure!(
+                    format::decode(entry.id, &read_entry(paths, env, &file)?)? == *host,
+                    "Путь записи VPS уже занят; существующая запись не изменена"
+                );
+                after.files.insert(file, Some(prior));
+            } else {
+                paths.require_new_file(&file, env)?;
+                writes.push((file, None, bytes));
+            }
+        }
+        after.hosts.insert(entry.id, hash);
+        index.hosts.push(entry);
+    }
+    ensure!(
+        by_id.keys().all(|id| after.hosts.contains_key(id)),
+        "Удаление записей не поддерживается; архивируйте VPS"
+    );
+    let index_path = PathBuf::from(INDEX);
+    if before.index.as_ref() != Some(&index) {
+        let bytes =
+            serde_json::to_vec(&index).map_err(|_| anyhow!("Не удалось сериализовать индекс"))?;
+        writes.push((index_path, before.files[Path::new(INDEX)], bytes));
+    } else {
+        after
+            .files
+            .insert(index_path, before.files[Path::new(INDEX)]);
+    }
+    after.index = Some(index);
+    if writes.is_empty() {
+        return Ok(after);
+    }
+    fs::create_dir_all(&paths.dir).map_err(|_| anyhow!("Не удалось создать папку хранилища"))?;
+    let tmp = Builder::new()
+        .prefix(".host-manager-")
+        .tempdir_in(&paths.dir)
+        .map_err(|_| anyhow!("Не удалось создать временную папку хранилища"))?;
+    // pass won't discover the parent repository when this directory is its store root.
+    let mut prepared = Vec::with_capacity(writes.len());
+    for (number, (file, prior, bytes)) in writes.into_iter().enumerate() {
+        let parent = paths.check_parent(&file)?;
+        let recipients = recipients(&paths.root, &parent, env)?;
+        let source = encrypt_entry(
+            env,
+            &tmp,
+            recipients.as_deref(),
+            &number.to_string(),
+            &bytes,
+        )?;
+        let hash = ciphertext_hash(&source)?.ok_or_else(|| anyhow!("Временная запись пропала"))?;
+        prepared.push((file, prior, parent, source, hash));
+    }
+    before.check(paths)?;
+    after.check(paths)?;
+    if prepared
+        .last()
+        .is_some_and(|(file, ..)| file == Path::new(INDEX))
+    {
+        sync_directory(paths.dir.parent().expect("pass namespace inside root"))?;
+    }
+    for (file, prior, parent, source, hash) in prepared {
+        ensure!(
+            paths.hash(&file)? == prior,
+            "Запись изменена извне; сохранение остановлено"
+        );
+        fs::create_dir_all(&parent).map_err(|_| anyhow!("Не удалось создать папку записей VPS"))?;
+        if file == Path::new(INDEX) {
+            // Persist the hosts directory entry before publishing its index.
+            sync_directory(&parent)?;
+        }
+        let dest = paths.dir.join(&file);
+        if prior.is_some() {
+            fs::rename(&source, dest)
+        } else {
+            fs::hard_link(&source, dest)
+        }
+        .map_err(|_| anyhow!("Не удалось опубликовать запись; перечитайте хранилище"))?;
+        sync_directory(&parent)?;
+        after.files.insert(file, Some(hash));
+    }
+    after.check(paths)?;
+    Ok(after)
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|_| anyhow!("Не удалось сбросить изменения папки на диск; перечитайте хранилище"))
 }
 
 pub fn load_catalog(pass_dir: &Path, env: &Environment) -> Result<Catalog> {
@@ -387,8 +743,7 @@ impl PassStore {
             paths,
             env,
             _lock: lock,
-            baseline: None,
-            writable: false,
+            snapshot: None,
         })
     }
 
@@ -401,50 +756,28 @@ impl PassStore {
     }
 
     pub fn load(&mut self) -> Result<Catalog> {
-        self.writable = false;
-        let (catalog, baseline) = read_catalog(&self.paths, &self.env)?;
-        self.baseline = baseline;
-        self.writable = true;
+        self.snapshot = None;
+        let (catalog, snapshot) = read_catalog(&self.paths, &self.env)?;
+        self.snapshot = Some(snapshot);
         Ok(catalog)
     }
 
-    fn check_baseline(&self) -> Result<()> {
-        self.paths.check_files()?;
-        ensure!(
-            ciphertext_hash(&self.paths.catalog())? == self.baseline,
-            "Каталог изменён извне; повторите загрузку перед сохранением"
-        );
-        Ok(())
-    }
-
-    fn staged(&self) -> Result<bool> {
-        let output = git(&self.env, &self.paths.dir)
-            .args(["diff", "--cached", "--quiet", "--exit-code"])
-            .output()
-            .map_err(|_| anyhow!("Не удалось проверить индекс Git"))?;
-        match output.status.code() {
-            Some(0) => Ok(false),
-            Some(1) => Ok(true),
-            _ => bail!("Не удалось проверить индекс Git"),
-        }
-    }
-
     pub fn save(&mut self, catalog: &Catalog) -> Result<SaveOutcome> {
-        ensure!(
-            self.writable,
-            "Запись заблокирована до успешной повторной загрузки каталога"
-        );
+        let before = self.snapshot.as_ref().ok_or_else(|| {
+            anyhow!("Запись заблокирована до успешной повторной загрузки каталога")
+        })?;
         catalog
             .validate()
             .map_err(|_| anyhow!("Каталог не прошёл проверку; сохранение отменено"))?;
-        self.check_baseline()?;
+        before.check(&self.paths)?;
         ensure!(
-            !file_state(&self.paths.pending())?,
-            "Найдена запись восстановления {}; разберите её вручную через pass",
-            self.paths.pending().display()
+            before
+                .files
+                .get(Path::new(PENDING))
+                .is_none_or(Option::is_none),
+            "Найдена запись восстановления catalog.pending.gpg; разберите её вручную через pass"
         );
-        let existing = check_directory_chain(&self.paths.root, &self.paths.dir)?;
-        let staged = git(&self.env, &existing)
+        let staged = git(&self.env, &self.paths.repo_dir)
             .args(["diff", "--cached", "--quiet", "--exit-code"])
             .output()
             .map_err(|_| anyhow!("Не удалось проверить индекс Git"))?;
@@ -452,179 +785,16 @@ impl PassStore {
             staged.status.code() == Some(0),
             "Индекс Git содержит изменения или недоступен; сохранение отменено"
         );
-        let bytes =
-            serde_json::to_vec(catalog).map_err(|_| anyhow!("Не удалось сериализовать каталог"))?;
-        let mut child = command("pass", &self.env)
-            .args(["insert", "--multiline", "--force", "--"])
-            .arg(self.paths.entry(true))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| anyhow!("Не удалось запустить pass для сохранения"))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("Не удалось открыть ввод pass"))?;
-        let output: Output = std::thread::scope(|scope| {
-            let bytes = &bytes;
-            let writer = scope.spawn(move || {
-                let result = stdin.write_all(bytes);
-                drop(stdin);
-                result
-            });
-            let output = child.wait_with_output();
-            // stdin must close in the writer before wait_with_output can observe EOF.
-            let written = writer
-                .join()
-                .map_err(|_| anyhow!("Не удалось передать каталог в pass"))?;
-            written.map_err(|_| {
-                anyhow!("Не удалось передать каталог в pass; проверьте catalog.pending.gpg")
-            })?;
-            output.map_err(|_| anyhow!("Не удалось дождаться pass; проверьте catalog.pending.gpg"))
-        })?;
-        ensure!(
-            output.status.success(),
-            "pass не подтвердил запись; проверьте catalog.pending.gpg, основной каталог не заменён"
-        );
-        ensure!(
-            read_output(&self.paths, &self.env, true)? == bytes,
-            "Проверка catalog.pending.gpg не пройдена; основной каталог не заменён"
-        );
-        self.finalize(&bytes)
-    }
-
-    fn finalize(&mut self, bytes: &[u8]) -> Result<SaveOutcome> {
-        ensure!(
-            !self.staged()?,
-            "Индекс Git содержит изменения; catalog.pending.gpg сохранён для восстановления"
-        );
-        self.check_baseline()?;
-        self.writable = false;
-        let moved = command("pass", &self.env)
-            .args(["mv", "--force", "--"])
-            .arg(self.paths.entry(true))
-            .arg(self.paths.entry(false))
-            .output();
-        let baseline = (|| -> Result<[u8; 32]> {
-            let before = ciphertext_hash(&self.paths.catalog())?
-                .ok_or_else(|| anyhow!("Основной каталог отсутствует"))?;
-            ensure!(
-                read_output(&self.paths, &self.env, false)?.as_slice() == bytes,
-                "Содержимое не совпало"
-            );
-            ensure!(
-                ciphertext_hash(&self.paths.catalog())? == Some(before),
-                "Каталог изменился во время проверки"
-            );
-            Ok(before)
-        })()
-        .map_err(|_| {
-            anyhow!("Результат сохранения неопределён; повторная запись заблокирована до загрузки")
-        })?;
-        self.baseline = Some(baseline);
-        self.writable = true;
-        // pass can mask a failed Git hook with its final exit 0; a leftover index is also a warning.
-        let warning =
-            !moved.is_ok_and(|output| output.status.success()) || self.staged().unwrap_or(true);
-        Ok(if warning {
-            SaveOutcome::SavedWithPassWarning
-        } else {
+        // Once publication starts, a failure may have changed the working copy.
+        let before = self.snapshot.take().expect("loaded snapshot");
+        let after = publish(&self.paths, &self.env, &before, catalog)?;
+        let files: Vec<_> = after.files.keys().cloned().collect();
+        let committed = commit_entries(&self.paths, &self.env, &files);
+        self.snapshot = Some(after);
+        Ok(if committed {
             SaveOutcome::Saved
-        })
-    }
-}
-
-#[cfg(test)]
-#[path = "../tests/common/mod.rs"]
-mod test_common;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::Payment;
-    use chrono::{Days, Local};
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn verified_move_with_rejecting_git_hook_is_saved_once_with_warning() {
-        let fixture = test_common::Fixture::new();
-        let mut store = PassStore::open(&fixture.dir, fixture.env.clone()).unwrap();
-        let mut catalog = store.load().unwrap();
-        catalog.hosts.push(test_common::sample_host());
-        assert_eq!(store.save(&catalog).unwrap(), SaveOutcome::Saved);
-        let today = Local::now().date_naive();
-        let next_due = today.checked_add_days(Days::new(60)).unwrap();
-        catalog.hosts[0].payments.push(Payment {
-            paid_on: today,
-            amount: rust_decimal::Decimal::new(450, 2),
-            currency: "EUR".into(),
-            next_due,
-        });
-        catalog.hosts[0].billing.next_due = Some(next_due);
-        let bytes = serde_json::to_vec(&catalog).unwrap();
-        let mut child = fixture
-            .command("pass")
-            .args([
-                "insert",
-                "--multiline",
-                "--force",
-                "--",
-                "host-manager/catalog.pending",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut input = child.stdin.take().unwrap();
-        std::thread::scope(|scope| {
-            let bytes = &bytes;
-            let writer = scope.spawn(move || {
-                input.write_all(&bytes).unwrap();
-            });
-            assert!(child.wait_with_output().unwrap().status.success());
-            writer.join().unwrap();
-        });
-        assert!(read_entry(&store.paths, &store.env, true).unwrap() == catalog);
-        let hook = fixture.root.join(".git/hooks/pre-commit");
-        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
-        // Real pass 1.7.4 may exit 0 despite this hook; the remaining index exposes the warning.
-        assert_eq!(
-            store.finalize(&bytes).unwrap(),
+        } else {
             SaveOutcome::SavedWithPassWarning
-        );
-        let loaded = store.load().unwrap();
-        assert!(loaded == catalog);
-        assert_eq!(loaded.hosts[0].payments.len(), 1);
-        assert_eq!(
-            loaded.hosts[0].payments[0].amount,
-            rust_decimal::Decimal::new(450, 2)
-        );
-        assert!(store.staged().unwrap());
-        assert!(!fixture.dir.join("catalog.pending.gpg").exists());
-    }
-
-    #[test]
-    fn unconfirmed_finalization_blocks_writes_until_successful_reload() {
-        let fixture = test_common::Fixture::new();
-        let mut store = PassStore::open(&fixture.dir, fixture.env.clone()).unwrap();
-        let mut catalog = store.load().unwrap();
-        catalog.hosts.push(test_common::sample_host());
-        store.save(&catalog).unwrap();
-        let before = fs::read(fixture.dir.join("catalog.gpg")).unwrap();
-        catalog.hosts[0].notes = "unsaved change".into();
-        assert!(
-            store
-                .finalize(&serde_json::to_vec(&catalog).unwrap())
-                .is_err()
-        );
-        assert!(!store.writable);
-        assert!(store.save(&catalog).is_err());
-        assert_eq!(fs::read(fixture.dir.join("catalog.gpg")).unwrap(), before);
-        let reloaded = store.load().unwrap();
-        assert!(store.writable);
-        assert!(reloaded.hosts[0].notes.is_empty());
+        })
     }
 }
